@@ -1109,103 +1109,97 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
     }
     auto prompt = apply_chat_template(chat_prompts);
 
-    // Prompt cache: compare current prompt text against the previous turn's to
-    // find the common prefix, then only tokenize and prefill the new suffix.
-    if (mConfig->prompt_cache() && !mCachedPromptText.empty()) {
-        // Use add_generation_prompt=false for comparison to avoid enable_thinking
-        // asymmetry: the template adds <think> to the LAST assistant message only
-        // when true. Using false renders all messages consistently.
-        auto prompt_for_compare = mTokenizer->apply_chat_template(chat_prompts, false);
-        size_t text_common = 0;
-        size_t text_max = std::min(mCachedPromptText.size(), prompt_for_compare.size());
-        while (text_common < text_max && mCachedPromptText[text_common] == prompt_for_compare[text_common])
-            text_common++;
+    // Prompt cache: compare token arrays (not text) to find the common prefix
+    // for KV cache reuse on multi-turn conversations.
+    //
+    // PROBLEM: The original implementation compared prompt TEXT strings to find
+    // the common prefix. This was brittle because Jinja templates can produce
+    // different text output for the same conversation history depending on
+    // context flags like enable_thinking, tool/function presence, etc. Even a
+    // single character difference in the text comparison forced a full
+    // re-prefill (tokenize + prefill ALL tokens from scratch), wasting the KV
+    // cache that was perfectly valid for the overlapping tokens.
+    //
+    // SOLUTION: Compare token ID arrays (mLastInputTokens vs full_tokens)
+    // instead of text. The model's KV cache entries correspond to token
+    // positions, so token-array comparison directly measures what can actually
+    // be reused. Any common prefix (common > 0) is reused — we slice off the
+    // delta tokens and only prefill those, skipping both tokenization and
+    // prefill for the shared prefix.
+    if (mConfig->prompt_cache() && !mLastInputTokens.empty()) {
+        auto full_tokens = tokenizer_encode(prompt);
 
-        // If history was trimmed (text_common < cached), fall back to full
-        // re-prefill rather than conditioning on stale KV entries.
-        if (text_common < mCachedPromptText.size()) {
-            // History was trimmed — clear all stale state and do full re-prefill.
-            mCachedPromptText.clear();
-            mContext->all_seq_len = 0;
-            mContext->history_tokens.clear();
-            mMeta->remove = mMeta->previous;
-            std::vector<int> input_ids = tokenizer_encode(prompt);
-            size_t history_before = input_ids.size(); // generate() pushes these first
-            response(input_ids, os, end_with, max_new_tokens);
-            if (mConfig->prompt_cache()) {
-                updateCachedPromptText(chat_prompts, history_before);
+        size_t common = 0;
+        size_t limit = std::min(mLastInputTokens.size(), full_tokens.size());
+        while (common < limit && mLastInputTokens[common] == full_tokens[common])
+            common++;
+
+        // Changed from common == mLastInputTokens.size() (exact match only) to
+        // common > 0 (any prefix match): even a partial match saves significant
+        // work on long conversations where the first 1100+ of 1200+ tokens are
+        // identical but the tail differs.
+        //
+        // Require common < full_tokens.size(): when the current prompt's tokens
+        // are fully contained in the cached prefix (common == full — e.g. the
+        // user repeats the exact same prompt), delta is empty. generate() with
+        // a zero-length input runs the model forward on seq_len == 0, and the
+        // attention/mask path divides by the sequence length, crashing with
+        // STATUS_INTEGER_DIVIDE_BY_ZERO. Fall back to full re-prefill instead.
+        if (common > 0 && common < full_tokens.size()) {
+            std::vector<int> delta(full_tokens.begin() + common, full_tokens.end());
+
+            MNN_PRINT("[prompt_cache] REUSE common=%zu last=%zu full=%zu delta=%zu\n",
+                      common, mLastInputTokens.size(), full_tokens.size(), delta.size());
+
+            if (common < mMeta->previous) {
+                mMeta->remove = mMeta->previous - common;
             }
+            if (common <= static_cast<size_t>(mContext->all_seq_len)) {
+                mContext->all_seq_len = static_cast<int>(common);
+            }
+            if (common < mContext->history_tokens.size()) {
+                mContext->history_tokens.resize(common);
+            }
+
+            generate_init(os, end_with);
+
+            CHECK_LLM_RUNNING(mContext);
+            size_t history_before = mContext->history_tokens.size() + delta.size();
+            generate(delta, max_new_tokens);
+
+            updateCachedPromptText(chat_prompts, history_before);
             return;
         }
 
-        // Tokenize the full prompt and split at a token boundary rather than
-        // tokenizing a text substring (which can land mid-token for BPE/UTF-8).
-        std::vector<int> full_tokens = tokenizer_encode(prompt);
-        // Detect prefix token count (BOS, etc.) by encoding an empty string.
-        // tokenizer_encode("") returns only the prefix tokens that are
-        // automatically prepended to every input (e.g., <|begin_of_text|>).
-        // This count is used to skip prefix tokens when mapping text
-        // positions to token indices, since they don't correspond to any
-        // prompt text bytes. Assumption: prefix tokens are constant across
-        // inputs for a given tokenizer configuration.
-        size_t prefix_count = tokenizer_encode("").size();
-        size_t char_pos = 0;
-        size_t token_split = prefix_count; // start after prefix tokens
-        for (size_t i = prefix_count; i < full_tokens.size(); i++) {
-            std::string piece = tokenizer_decode(full_tokens[i]);
-            if (char_pos + piece.size() > text_common)
-                break;
-            char_pos += piece.size();
-            token_split++;
+        MNN_PRINT("[prompt_cache] NO-COMMON last=%zu full=%zu — full re-prefill\n",
+                  mLastInputTokens.size(), full_tokens.size());
+        mLastInputTokens.clear();
+        mCachedPromptText.clear();
+        mContext->all_seq_len = 0;
+        mContext->history_tokens.clear();
+        mMeta->remove = mMeta->previous;
+        std::vector<int> input_ids = tokenizer_encode(prompt);
+        size_t history_before = input_ids.size();
+        response(input_ids, os, end_with, max_new_tokens);
+        if (mConfig->prompt_cache()) {
+            updateCachedPromptText(chat_prompts, history_before);
         }
-        std::vector<int> delta(full_tokens.begin() + token_split, full_tokens.end());
-        MNN_PRINT("[prompt_cache] cached=%d, compare=%d, common=%d, token_split=%d, delta=%d\n",
-                  (int)mCachedPromptText.size(), (int)prompt_for_compare.size(), (int)text_common, (int)token_split,
-                  (int)delta.size());
-
-        // Save/restore KV state across generate_init — only the delta path
-        // should preserve KV; other response() overloads clear as normal.
-        // Also preserve mMeta->remove so that a pending eraseHistory() (from
-        // a prior cancelled decode) is not silently cleared before sync().
-        int saved_all_seq_len = mContext->all_seq_len;
-        auto saved_history = std::move(mContext->history_tokens);
-        size_t saved_previous = mMeta->previous;
-        size_t saved_remove = mMeta->remove;
-        generate_init(os, end_with);
-        mContext->all_seq_len = saved_all_seq_len;
-        mContext->history_tokens = std::move(saved_history);
-        mMeta->previous = saved_previous;
-        mMeta->remove = saved_remove;
-        CHECK_LLM_RUNNING(mContext);
-        // history_before must account for the delta tokens that generate()
-        // pushes into history_tokens before decode starts, so that
-        // updateCachedPromptText only sees the assistant response tokens.
-        size_t history_before = mContext->history_tokens.size() + delta.size();
-        generate(delta, max_new_tokens);
-
-        // Update cache after generation so non-Android callers (llm_demo,
-        // mls) don't need to call syncPromptCache() externally.
-        updateCachedPromptText(chat_prompts, history_before);
+        return;
     } else {
         // First turn or prompt_cache disabled: full tokenization, full prefill.
-        // Clear any existing KV state before a full re-prefill. generate_init()
-        // only clears KV when reuse_kv=false, so handle reuse_kv=true here.
         if (mContext->all_seq_len > 0) {
             mContext->all_seq_len = 0;
             mContext->history_tokens.clear();
             mMeta->remove = mMeta->previous;
         }
         std::vector<int> input_ids = tokenizer_encode(prompt);
-        // history_before accounts for input_ids that generate() pushes first
         size_t history_before = input_ids.size();
         response(input_ids, os, end_with, max_new_tokens);
         if (mConfig->prompt_cache()) {
             updateCachedPromptText(chat_prompts, history_before);
         } else {
-            // Cache text must not survive while caching is disabled —
-            // if re-enabled later, stale text would mismatch the KV state
-            // that was rebuilt from scratch on each turn while disabled.
             mCachedPromptText.clear();
+            mLastInputTokens.clear();
         }
     }
 }
@@ -1231,8 +1225,12 @@ void Llm::updateCachedPromptText(const ChatMessages& chat_prompts, size_t histor
     if (!response_text.empty()) {
         msgs_with_response.emplace_back("assistant", response_text);
     }
-    mCachedPromptText = mTokenizer->apply_chat_template(msgs_with_response, false);
+    // Cache as text (stripped, for syncPromptCache/text-API compat) and
+    // as tokens (unstripped, for next turn's token-array comparison).
+    auto full_text = mTokenizer->apply_chat_template(msgs_with_response, false);
+    mCachedPromptText = full_text;
     MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    mLastInputTokens = tokenizer_encode(full_text);
 }
 
 Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {

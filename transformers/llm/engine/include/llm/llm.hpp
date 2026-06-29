@@ -255,6 +255,11 @@ private:
     void completePrefixWrite();
     // Prompt cache state
     std::string mCachedPromptText;
+    // Full token array of the previous input (no gen prompt). Used for token-
+    // level prefix comparison in prompt cache: stored alongside the text cache
+    // because token comparison is robust against Jinja template inconsistencies
+    // that produce different text for the same conversation history.
+    std::vector<int> mLastInputTokens;
     void updateCachedPromptText(const ChatMessages& chat_prompts, size_t history_before);
 };
 
