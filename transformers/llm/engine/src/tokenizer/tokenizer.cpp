@@ -97,11 +97,34 @@ Tokenizer* Tokenizer::createTokenizer(const std::string& filename) {
         auto* pt = new PipelineTokenizer();
         tokenizer = pt;
         tokenizer->load_special(tok_file);
-        auto pos = tok_file.tellg();
         tok_file.close();
         std::ifstream bin_file(filename, std::ios::binary);
-        bin_file.seekg(pos);
-        pt->load_vocab_binary(bin_file);
+        // The text header is exactly three lines (magic+type, token counts,
+        // token-id list); the binary body starts right after the third '\n'.
+        // Scan for it in binary mode: text-mode tellg() is unreliable on
+        // Windows (off-by-N after getline), which previously started the
+        // vocab walk 3 bytes late and desynchronized the whole .mtok parse
+        // (observed heap corruption / segfault on LFM2.5-230M).
+        char ch;
+        int header_lines = 0;
+        while (header_lines < 3 && bin_file.get(ch)) {
+            if (ch == '\n') header_lines++;
+        }
+        if (header_lines < 3) {
+            MNN_ERROR("[Tokenizer] mtok truncated header in: %s\n", filename.c_str());
+            bin_file.close();
+            delete pt;
+            return nullptr;
+        }
+        if (!pt->load_vocab_binary(bin_file)) {
+            // Fail loud (return code only: exceptions are unsupported on
+            // Android). Never return a half-built tokenizer: partial vocabs
+            // mistokenize silently, which is worse than refusing to load.
+            MNN_ERROR("[Tokenizer] mtok vocab load failed in: %s\n", filename.c_str());
+            bin_file.close();
+            delete pt;
+            return nullptr;
+        }
         bin_file.close();
         tokenizer->cache_special_tokens();
         return tokenizer;
@@ -2145,13 +2168,47 @@ bool PipelineTokenizer::load_vocab(std::ifstream& file) { return false; }
 // ==========================================
 // Binary read helpers
 // ==========================================
+// Bounds-checked .mtok walk: load_vocab_binary installs g_bin_end, and every
+// helper records an overrun in g_bin_error instead of reading past the buffer
+// (no exceptions: MNN builds with -fno-exceptions, so failures surface as
+// MNN_ERROR logs plus a false return that aborts the walk at the next
+// section boundary). Previously any format drift meant silent OOB
+// reads/writes and a segfault deep inside load (e.g. LFM2.5-230M
+// tokenizer.mtok).
+namespace {
+thread_local const char* g_bin_end = nullptr;
+thread_local bool g_bin_error = false;
+}  // namespace
+
+// Scoped bounds installer: active only while the binary body is walked.
+struct BinBounds {
+    const char* prev = nullptr;
+    bool prev_err = false;
+    explicit BinBounds(const char* end) {
+        prev = g_bin_end;
+        prev_err = g_bin_error;
+        g_bin_end = end;
+        g_bin_error = false;
+    }
+    ~BinBounds() { g_bin_end = prev; g_bin_error = prev_err; }
+};
+
+static inline void require_bin(const char* p, size_t n, const char* what) {
+    if (g_bin_end != nullptr && (n > (size_t)(g_bin_end - p))) {
+        MNN_ERROR("[Tokenizer] mtok overrun in %s\n", what);
+        g_bin_error = true;
+    }
+}
+
 static inline uint8_t read_u8(const char*& p) {
+    require_bin(p, 1, "u8");
     uint8_t v = *(const uint8_t*)p;
     p += 1;
     return v;
 }
 
 static inline uint16_t read_u16(const char*& p) {
+    require_bin(p, 2, "u16");
     uint16_t v;
     memcpy(&v, p, 2);
     p += 2;
@@ -2159,6 +2216,7 @@ static inline uint16_t read_u16(const char*& p) {
 }
 
 static inline uint32_t read_u32(const char*& p) {
+    require_bin(p, 4, "u32");
     uint32_t v;
     memcpy(&v, p, 4);
     p += 4;
@@ -2166,6 +2224,7 @@ static inline uint32_t read_u32(const char*& p) {
 }
 
 static inline double read_f64(const char*& p) {
+    require_bin(p, 8, "f64");
     double v;
     memcpy(&v, p, 8);
     p += 8;
@@ -2174,6 +2233,7 @@ static inline double read_f64(const char*& p) {
 
 static inline std::string read_str(const char*& p) {
     uint16_t len = read_u16(p);
+    require_bin(p, len, "str");
     std::string s(p, len);
     p += len;
     return s;
@@ -2182,6 +2242,7 @@ static inline std::string read_str(const char*& p) {
 // Zero-copy: returns StringRef pointing into buffer
 static inline StringRef read_str_ref(const char*& p) {
     uint16_t len = read_u16(p);
+    require_bin(p, len, "str_ref");
     StringRef r = {p, len};
     p += len;
     return r;
@@ -2200,6 +2261,7 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
     binary_buf_.resize(remaining);
     file.read(&binary_buf_[0], remaining);
     const char* ptr = binary_buf_.c_str();
+    BinBounds bounds(binary_buf_.data() + binary_buf_.size());
 
     // --- Normalizer ---
     auto read_norm_table = [](const char*& p) -> std::vector<std::pair<uint32_t, std::string>> {
@@ -2209,6 +2271,7 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
         for (uint32_t i = 0; i < count; i++) {
             uint32_t cp = read_u32(p);
             uint16_t len = read_u16(p);
+            require_bin(p, len, "norm_table_entry");
             table.push_back({cp, std::string(p, len)});
             p += len;
         }
@@ -2266,6 +2329,9 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
         return nullptr;
     };
     normalizer_ = read_normalizer_bin(ptr);
+    if (g_bin_error) {
+        return false;
+    }
 
     // --- PreTokenizer ---
     std::function<std::unique_ptr<PreTokenizer>(const char*&)> read_pre_tokenizer_bin;
@@ -2299,6 +2365,9 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
         return nullptr;
     };
     pre_tokenizer_ = read_pre_tokenizer_bin(ptr);
+    if (g_bin_error) {
+        return false;
+    }
 
     // --- Model --- (zero-copy: StringRef points into buf)
     {
@@ -2315,14 +2384,25 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
             std::vector<StringRef> id_to_token(vocab_size);
             std::vector<VocabEntry> sorted_vocab(vocab_size);
             for (uint32_t i = 0; i < vocab_size; i++) {
+                if (g_bin_error) {
+                    return false;
+                }
                 StringRef sr = read_str_ref(ptr);
                 int id = (int)read_u32(ptr);
+                if (id < 0 || (size_t)id >= id_to_token.size()) {
+                    MNN_ERROR("[Tokenizer] mtok vocab id out of range: entry=%u id=%d vocab_size=%u offset=%td\n",
+                            i, id, vocab_size, ptr - binary_buf_.c_str());
+                    return false;
+                }
                 id_to_token[id] = sr;
                 sorted_vocab[i] = {sr.ptr, sr.len, id};
             }
             std::vector<std::pair<uint64_t, int>> merges;
             merges.reserve(merge_size);
             for (uint32_t i = 0; i < merge_size; i++) {
+                if (g_bin_error) {
+                    return false;
+                }
                 uint32_t id1 = read_u32(ptr);
                 uint32_t id2 = read_u32(ptr);
                 uint32_t rank = read_u32(ptr);
@@ -2339,8 +2419,15 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
             std::vector<StringRef> id_to_token(vocab_size);
             std::vector<VocabEntry> sorted_vocab(vocab_size);
             for (uint32_t i = 0; i < vocab_size; i++) {
+                if (g_bin_error) {
+                    return false;
+                }
                 StringRef sr = read_str_ref(ptr);
                 int id = (int)read_u32(ptr);
+                if (id < 0 || (size_t)id >= id_to_token.size()) {
+                    MNN_ERROR("[Tokenizer] mtok vocab id out of range\n");
+                    return false;
+                }
                 id_to_token[id] = sr;
                 sorted_vocab[i] = {sr.ptr, sr.len, id};
             }
@@ -2355,9 +2442,16 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
             std::vector<double> scores(vocab_size);
             std::vector<VocabEntry> sorted_vocab(vocab_size);
             for (uint32_t i = 0; i < vocab_size; i++) {
+                if (g_bin_error) {
+                    return false;
+                }
                 StringRef sr = read_str_ref(ptr);
                 int id = (int)read_u32(ptr);
                 double score = read_f64(ptr);
+                if (id < 0 || (size_t)id >= id_to_token.size()) {
+                    MNN_ERROR("[Tokenizer] mtok vocab id out of range\n");
+                    return false;
+                }
                 id_to_token[id] = sr;
                 scores[id] = score;
                 sorted_vocab[i] = {sr.ptr, sr.len, id};
@@ -2365,6 +2459,10 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
             ug->load_direct_sorted(std::move(id_to_token), std::move(scores), std::move(sorted_vocab));
             model_ = std::move(ug);
         }
+    }
+
+    if (g_bin_error) {
+        return false;
     }
 
     // --- Decoder ---
@@ -2402,11 +2500,18 @@ bool PipelineTokenizer::load_vocab_binary(std::ifstream& file) {
         return nullptr;
     };
     decoder_ = read_decoder_bin(ptr);
+    if (g_bin_error) {
+        return false;
+    }
 
     // --- Added Tokens ---
+    uint32_t added_count = 0;
     {
-        uint32_t count = read_u32(ptr);
-        for (uint32_t i = 0; i < count; i++) {
+        added_count = read_u32(ptr);
+        for (uint32_t i = 0; i < added_count; i++) {
+            if (g_bin_error) {
+                return false;
+            }
             uint32_t id = read_u32(ptr);
             uint8_t special = read_u8(ptr);
             uint8_t lstrip = read_u8(ptr);
