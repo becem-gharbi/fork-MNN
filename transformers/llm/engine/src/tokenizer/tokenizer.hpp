@@ -156,6 +156,17 @@ public:
     PostProcessorInfo post_process(std::vector<int>& ids) const { return apply_post_processor(ids); }
     virtual std::string decode(int id) = 0;
     virtual std::string decode(const std::vector<int>& ids);
+    // Grammar-constrained decoding support (model-agnostic).
+    // Normalized token piece exactly as a GBNF matcher sees it (mirrors
+    // llama.cpp token_to_piece_for_cache(..., special=true)):
+    //   - normal SPM/UGM pieces: '▁' (U+2581) unescaped to ' '
+    //   - byte pieces: single raw byte
+    //   - control/unknown/user-defined: raw text as-is
+    //   - BPE (tiktoken/HF): raw decoded bytes
+    virtual size_t vocab_size() const = 0;
+    virtual std::string piece_for_grammar(int id) = 0;
+    virtual bool is_eog(int id) { return is_stop(id); }
+    virtual std::vector<std::string> grammar_pieces();
     // chat template
     std::string apply_chat_template(const ChatMessages& messages, bool add_generation_prompt = true) const;
     std::string apply_chat_template(const std::string& user_content, const std::string& system_prompt = "") const;
@@ -192,6 +203,8 @@ class Sentencepiece : public Tokenizer {
 public:
     Sentencepiece() = default;
     virtual std::string decode(int id) override;
+    virtual size_t vocab_size() const override { return sentence_pieces_.size(); }
+    virtual std::string piece_for_grammar(int id) override;
 protected:
     virtual bool load_vocab(std::ifstream& file) override;
     virtual void encode(const std::string& str, std::vector<int>& ids) override;
@@ -244,6 +257,8 @@ class Tiktoken : public Tokenizer {
 public:
     Tiktoken() = default;
     virtual std::string decode(int id) override;
+    virtual size_t vocab_size() const override { return decoder_.size(); }
+    virtual std::string piece_for_grammar(int id) override;
 protected:
     virtual bool load_vocab(std::ifstream& file) override;
     virtual void encode(const std::string& str, std::vector<int>& ids) override;
@@ -255,6 +270,8 @@ class BertTokenizer : public Tokenizer {
 public:
     BertTokenizer() = default;
     virtual std::string decode(int id) override;
+    virtual size_t vocab_size() const override { return decoder_.size(); }
+    virtual std::string piece_for_grammar(int id) override;
 protected:
     virtual bool load_vocab(std::ifstream& file) override;
     virtual void encode(const std::string& str, std::vector<int>& ids) override;
@@ -277,6 +294,8 @@ using BPERanks = std::unordered_map<std::pair<std::wstring, std::wstring>, int, 
 public:
     HuggingfaceTokenizer() = default;
     virtual std::string decode(int id) override;
+    virtual size_t vocab_size() const override { return decoder_.size(); }
+    virtual std::string piece_for_grammar(int id) override;
 protected:
     virtual bool load_vocab(std::ifstream& file) override;
     virtual void encode(const std::string& str, std::vector<int>& ids) override;
@@ -325,6 +344,8 @@ public:
     virtual ~PipelineTokenizer();
     virtual std::string decode(int id) override;
     virtual std::string decode(const std::vector<int>& ids) override;
+    virtual size_t vocab_size() const override { return model_ ? model_->vocab_size() : 0; }
+    virtual std::string piece_for_grammar(int id) override;
     bool load_vocab_binary(std::ifstream& file);
 protected:
     virtual bool load_vocab(std::ifstream& file) override;
