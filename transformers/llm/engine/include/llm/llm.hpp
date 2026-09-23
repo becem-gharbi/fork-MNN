@@ -183,6 +183,20 @@ public:
     bool is_stop(int token);
     std::string tokenizer_decode(int token);
     virtual std::vector<int> tokenizer_encode(const std::string& query);
+    // grammar vocabulary access (model-agnostic)
+    size_t vocab_size() const;
+    std::string piece_for_grammar(int id);
+    bool is_eog(int id);
+    std::vector<std::string> grammar_pieces();
+    // logits hook for grammar-constrained decoding.
+    // process(last_token, logits, n): called before sampling with the exact
+    // float array the sampler will read; mask illegal tokens in place.
+    // accept(token): called after a token is selected (and before the context
+    // advances) so the grammar state can consume it.
+    using LogitsHookFn = std::function<void(int, float*, int)>;
+    using TokenHookFn  = std::function<void(int)>;
+    void setLogitsHook(LogitsHookFn process, TokenHookFn accept = nullptr);
+    void clearLogitsHook();
     friend class Pipeline;
     virtual std::vector<int> tokenizer_encode(const MultimodalPrompt& multimodal_input);
     // ptompt functions
@@ -212,6 +226,9 @@ protected:
     std::shared_ptr<Sampler> mSampler;
     std::shared_ptr<Express::Executor::RuntimeManager> mRuntimeManager, mProcessorRuntimeManager;
     std::shared_ptr<Express::Module> mModule;
+    LogitsHookFn mLogitsHook;
+    TokenHookFn mTokenHook;
+    std::vector<float> mLogitsScratch;
     /**
      key: <seq_len, all_logists>
      value : module

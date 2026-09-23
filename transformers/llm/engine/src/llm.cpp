@@ -467,6 +467,20 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
     int decode_seq = 1;
     // Set to decode mode
     mContext->gen_seq_len = 1;
+    // tuning samples are discarded (timing only) — do not feed the hook
+    LogitsHookFn saved_logits_hook = mLogitsHook;
+    TokenHookFn  saved_token_hook  = mTokenHook;
+    mLogitsHook = nullptr;
+    mTokenHook  = nullptr;
+    struct HookGuard {
+        Llm& self;
+        LogitsHookFn restored_logits_hook;
+        TokenHookFn  restored_token_hook;
+        ~HookGuard() {
+            self.mLogitsHook = std::move(restored_logits_hook);
+            self.mTokenHook  = std::move(restored_token_hook);
+        }
+    } hook_guard { *this, saved_logits_hook, saved_token_hook };
     if(mInSpec) {
         // start autoregressive decoding
         std::vector<int> input_ids = {0};
@@ -790,8 +804,51 @@ int Llm::sample(VARP logits, int offset, int size) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
         logits = _Const(logits->readMap<float>() + offset, {size}, NHWC, halide_type_of<float>());
     }
-    auto token_id = mSampler->sample(logits);
+    int token_id;
+    if (mLogitsHook) {
+        const auto& info = logits->getInfo();
+        const float* base = logits->readMap<float>();
+        // sampler reads exactly dim.back() floats from the base pointer
+        const int n = (int)info->dim.back();
+        // scratch copy before masking — never poison the engine-owned buffer
+        mLogitsScratch.assign(base, base + n);
+        int last_token = mContext ? mContext->current_token : -1;
+        mLogitsHook(last_token, mLogitsScratch.data(), n);
+        VARP masked = _Const(mLogitsScratch.data(), {n}, NHWC, halide_type_of<float>());
+        token_id = mSampler->sample(masked);
+    } else {
+        token_id = mSampler->sample(logits);
+    }
+    if (mTokenHook) {
+        mTokenHook(token_id);
+    }
     return token_id;
+}
+
+size_t Llm::vocab_size() const {
+    return mTokenizer ? mTokenizer->vocab_size() : 0;
+}
+
+std::string Llm::piece_for_grammar(int id) {
+    return mTokenizer ? mTokenizer->piece_for_grammar(id) : "";
+}
+
+bool Llm::is_eog(int id) {
+    return mTokenizer && mTokenizer->is_eog(id);
+}
+
+std::vector<std::string> Llm::grammar_pieces() {
+    return mTokenizer ? mTokenizer->grammar_pieces() : std::vector<std::string>();
+}
+
+void Llm::setLogitsHook(LogitsHookFn process, TokenHookFn accept) {
+    mLogitsHook = std::move(process);
+    mTokenHook = std::move(accept);
+}
+
+void Llm::clearLogitsHook() {
+    mLogitsHook = nullptr;
+    mTokenHook = nullptr;
 }
 
 void Llm::reset() {

@@ -27,6 +27,9 @@
 namespace MNN {
 namespace Transformer {
 
+std::wstring utf8_to_wstring(const char* str, size_t len);
+std::string wstring_to_utf8(const std::wstring& str);
+
 // base64
 static const int kBase64DecodeTable[] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0-15
@@ -486,6 +489,77 @@ std::string Sentencepiece::decode(int id) {
         piece.replace(pos, pos + 3, " ");
     }
     return piece;
+}
+
+std::string Sentencepiece::piece_for_grammar(int id) {
+    if (id < 0 || id >= static_cast<int>(sentence_pieces_.size())) {
+        return "";
+    }
+    const auto& piece = sentence_pieces_[id];
+    if (piece.type == PieceType::BYTE) {
+        // byte piece: single raw byte
+        return piece.piece;
+    }
+    if (piece.type != PieceType::NORMAL) {
+        // control / unknown / user-defined / unused: raw text as-is
+        return piece.piece;
+    }
+    // normal SPM piece: unescape U+2581 (▁) to ' '
+    std::string out = piece.piece;
+    std::string::size_type pos = 0;
+    const std::string meta = "\xe2\x96\x81";
+    while ((pos = out.find(meta, pos)) != std::string::npos) {
+        out.replace(pos, meta.size(), " ");
+        ++pos;
+    }
+    return out;
+}
+
+std::string Tiktoken::piece_for_grammar(int id) {
+    if (id < 0 || id >= static_cast<int>(decoder_.size())) {
+        return "";
+    }
+    // BPE (tiktoken) pieces are raw decoded bytes
+    return decoder_[id];
+}
+
+std::string BertTokenizer::piece_for_grammar(int id) {
+    if (id < 0 || id >= static_cast<int>(decoder_.size())) {
+        return "";
+    }
+    // WordPiece normal pieces: raw text as-is
+    return decoder_[id];
+}
+
+std::string HuggingfaceTokenizer::piece_for_grammar(int id) {
+    if (id < 0 || id >= static_cast<int>(decoder_.size())) {
+        return "";
+    }
+    // byte-level BPE pieces: decode utf8 → raw bytes
+    auto decode_utf8 = decoder_.at(id);
+    std::wstring w = utf8_to_wstring(decode_utf8.data(), decode_utf8.size());
+    std::string r;
+    for (wchar_t c : w) {
+        if (u2b_.find(c) != u2b_.end()) {
+            r.push_back(char(u2b_.at(c)));
+        }
+    }
+    return r;
+}
+
+std::string PipelineTokenizer::piece_for_grammar(int id) {
+    if (!model_) return "";
+    if (id < 0) return "";
+    return model_->id_to_token(id);
+}
+
+std::vector<std::string> Tokenizer::grammar_pieces() {
+    std::vector<std::string> result;
+    result.reserve(vocab_size());
+    for (int id = 0; id < static_cast<int>(vocab_size()); ++id) {
+        result.emplace_back(piece_for_grammar(id));
+    }
+    return result;
 }
 
 float Sentencepiece::get_score(int id) const {
