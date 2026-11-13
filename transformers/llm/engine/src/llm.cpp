@@ -1464,7 +1464,13 @@ void Llm::updateCachedPromptText(const ChatMessages& chat_prompts, size_t histor
         msgs_with_response.emplace_back("assistant", response_text);
     }
     mCachedPromptText = mTokenizer->apply_chat_template(msgs_with_response, false);
-    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    // Identity templates return the caller's pre-rendered prompt unchanged;
+    // stripping would make the cached text diverge from the next turn's compare
+    // text at every <think></think> marker.
+    const bool preRendered = chat_prompts.size() == 1 && mCachedPromptText == chat_prompts[0].second;
+    if (!preRendered) {
+        MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    }
 }
 
 Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
@@ -1597,10 +1603,13 @@ void Llm::syncPromptCache(const ChatMessages& chat_prompts) {
     if (!mConfig->prompt_cache() || chat_prompts.empty())
         return;
     // Override cached text with caller-provided messages (e.g. after
-    // deleteThinkPart processing in Android). Uses the same rendering
-    // and <think> stripping as updateCachedPromptText.
+    // deleteThinkPart processing in Android). Uses the same rendering and
+    // pre-rendered-prompt handling as updateCachedPromptText.
     mCachedPromptText = mTokenizer->apply_chat_template(chat_prompts, false);
-    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    const bool preRendered = chat_prompts.size() == 1 && mCachedPromptText == chat_prompts[0].second;
+    if (!preRendered) {
+        MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    }
 }
 
 static inline bool needNewVar(VARP var, int axis, int seq_len, int kv_seq_len = 0) {
