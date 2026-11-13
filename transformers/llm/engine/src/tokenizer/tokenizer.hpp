@@ -344,7 +344,14 @@ public:
     virtual ~PipelineTokenizer();
     virtual std::string decode(int id) override;
     virtual std::string decode(const std::vector<int>& ids) override;
-    virtual size_t vocab_size() const override { return model_ ? model_->vocab_size() : 0; }
+    virtual size_t vocab_size() const override {
+        if (!model_) return 0;
+        size_t size = model_->vocab_size();
+        for (const auto& at : added_tokens_) {
+            if (at.id >= 0 && static_cast<size_t>(at.id) + 1 > size) size = static_cast<size_t>(at.id) + 1;
+        }
+        return size;
+    }
     virtual std::string piece_for_grammar(int id) override;
     bool load_vocab_binary(std::ifstream& file);
 protected:

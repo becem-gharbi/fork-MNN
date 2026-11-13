@@ -568,9 +568,15 @@ std::string HuggingfaceTokenizer::piece_for_grammar(int id) {
 }
 
 std::string PipelineTokenizer::piece_for_grammar(int id) {
-    if (!model_) return "";
-    if (id < 0) return "";
-    return model_->id_to_token(id);
+    if (!model_ || id < 0) return "";
+    for (const auto& at : added_tokens_) {
+        if (at.id == id) return at.content;
+    }
+    // Grammar needs the same raw piece the model actually emits, including
+    // byte-level and metaspace transforms. WordPiece keeps its raw form so
+    // the continuation prefix stays visible to the grammar.
+    if (wordpiece_decode_) return model_->id_to_token(id);
+    return decode(id);
 }
 
 std::vector<std::string> Tokenizer::grammar_pieces() {
@@ -1188,6 +1194,31 @@ static std::vector<std::string> create_bytes_char_map() {
         bs[b] = temp_bs[(unsigned char)b];
     }
     return bs;
+}
+
+// Reverse GPT-2 byte-level encoding: map the unicode characters back to raw bytes.
+static std::string byte_level_decode(const std::string& token) {
+    static auto bm = []() {
+        std::unordered_map<std::string, unsigned char> m;
+        auto byte_vec = create_bytes_char_map();
+        for (int i = 0; i < 256; ++i) {
+            if (!byte_vec[i].empty()) m[byte_vec[i]] = (unsigned char)i;
+        }
+        return m;
+    }();
+    std::string out;
+    const uint8_t* p = (const uint8_t*)token.data();
+    size_t len = token.size(), i = 0;
+    while (i < len) {
+        int32_t cp;
+        int r = Unicode::utf8_decode(p + i, len - i, &cp);
+        std::string ch(token.substr(i, r));
+        auto it = bm.find(ch);
+        if (it != bm.end()) out += (char)it->second;
+        else out += ch;
+        i += r;
+    }
+    return out;
 }
 
 
@@ -2120,7 +2151,15 @@ std::string PipelineTokenizer::decode(const std::vector<int>& ids) {
     for (int id : ids) {
         // Skip special tokens (like [UNK], [CLS], [SEP], etc.)
         if (is_special(id)) continue;
-        tokens.push_back(model_->id_to_token(id));
+        bool is_added = false;
+        for (const auto& at : added_tokens_) {
+            if (at.id == id) {
+                tokens.push_back(at.content);
+                is_added = true;
+                break;
+            }
+        }
+        if (!is_added) tokens.push_back(model_->id_to_token(id));
     }
     if (decoder_) {
         decoder_->decode_chain(tokens);
@@ -2147,6 +2186,9 @@ std::string PipelineTokenizer::decode(const std::vector<int>& ids) {
 
 std::string PipelineTokenizer::decode(int id) {
     if (!model_) return "";
+    for (const auto& at : added_tokens_) {
+        if (at.id == id) return at.content;
+    }
     std::string token = model_->id_to_token(id);
     // For single-token decode (streaming), apply Replace/ByteFallback/ByteLevel
     // but not Strip/Fuse which are meant for full-sequence decode.
@@ -2184,26 +2226,7 @@ std::string PipelineTokenizer::decode(int id) {
     }
     // If model has ByteLevel encoding, reverse byte map
     if (byte_level_) {
-        static auto bm = []() {
-            std::unordered_map<std::string, unsigned char> m;
-            auto byte_vec = create_bytes_char_map();
-            for (int i = 0; i < 256; ++i) {
-                if (!byte_vec[i].empty()) m[byte_vec[i]] = (unsigned char)i;
-            }
-            return m;
-        }();
-        std::string out;
-        const uint8_t* p = (const uint8_t*)result.data();
-        size_t len = result.size(), i = 0;
-        while (i < len) {
-            int32_t cp; int r = Unicode::utf8_decode(p + i, len - i, &cp);
-            std::string ch(result.substr(i, r));
-            auto it = bm.find(ch);
-            if (it != bm.end()) out += (char)it->second;
-            else out += ch;
-            i += r;
-        }
-        return out;
+        return byte_level_decode(result);
     }
     return result;
 }
